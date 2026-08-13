@@ -1,0 +1,23 @@
+{
+  "1": {
+    "advisory_id": "GHSA-5p4m-2wfm-xmqj",
+    "package": "js-yaml",
+    "ecosystem": "npm",
+    "current_versions": [
+      "3.15.0",
+      "4.3.0"
+    ],
+    "affected_ranges": [
+      ">=3.0.0 <3.15.1",
+      ">=4.0.0 <4.3.1"
+    ],
+    "fixed_versions": {
+      "3": "3.15.1",
+      "4": "4.3.1"
+    },
+    "manifest_path": "superset-frontend/package.json",
+    "lockfile_path": "superset-frontend/package-lock.json",
+    "test_command": "npm --prefix superset-frontend test -- src/dashboard/components/OverwriteConfirm/OverwriteConfirmModal.test.tsx --runInBand",
+    "advisory_url": "https://github.com/advisories/GHSA-5p4m-2wfm-xmqj"
+  }
+}
