@@ -32,5 +32,24 @@ Check the service is up:
 curl http://127.0.0.1:8000/health
 ```
 
-Webhook processing (`POST /webhook/github`) is intentionally deferred to
-Step 7 — it currently returns HTTP 501.
+## Webhook intake (Step 7)
+
+`POST /webhook/github` now authenticates and records GitHub webhook
+deliveries:
+
+- `WEBHOOK_SECRET` must match the secret configured on the GitHub webhook;
+  requests are verified with an HMAC-SHA256 signature over the raw body.
+- `GITHUB_REPO` is the only repository (`owner/name`) accepted; all other
+  repositories are rejected.
+- `APPROVED_ACTORS` is a comma-separated allowlist of GitHub usernames
+  permitted to trigger remediation.
+
+The endpoint validates the request, deduplicates the delivery, and records a
+curated `devin-remediate` label event — it does not yet create a Devin
+session or call any external API.
+
+Run the tests:
+
+```bash
+python -m unittest -v test_webhook.py
+```

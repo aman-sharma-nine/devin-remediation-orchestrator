@@ -3,6 +3,7 @@
 import os
 import sqlite3
 import threading
+from datetime import datetime, timezone
 
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "./orchestrator.db")
 
@@ -50,6 +51,27 @@ def init_db():
             """
         )
         _conn.commit()
+
+
+def record_delivery(delivery_id: str) -> bool:
+    if not delivery_id:
+        raise ValueError("delivery_id must be non-empty")
+
+    received_at = datetime.now(timezone.utc).isoformat()
+
+    with _lock:
+        if _conn is None:
+            raise RuntimeError("database connection has not been initialized")
+
+        cursor = _conn.execute(
+            """
+            INSERT INTO deliveries (delivery_id, received_at) VALUES (?, ?)
+            ON CONFLICT(delivery_id) DO NOTHING
+            """,
+            (delivery_id, received_at),
+        )
+        _conn.commit()
+        return cursor.rowcount == 1
 
 
 def close_connection():
