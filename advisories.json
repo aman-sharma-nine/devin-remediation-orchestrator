@@ -17,7 +17,7 @@
     },
     "manifest_path": "superset-frontend/package.json",
     "lockfile_path": "superset-frontend/package-lock.json",
-    "test_command": "npm --prefix superset-frontend test -- src/dashboard/components/OverwriteConfirm/OverwriteConfirmModal.test.tsx --runInBand",
+    "test_command": "npm --prefix superset-frontend test -- src/dashboard/components/OverwriteConfirm/OverwriteConfirmModal.test.tsx",
     "advisory_url": "https://github.com/advisories/GHSA-5p4m-2wfm-xmqj"
   }
 }
