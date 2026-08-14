@@ -1,5 +1,6 @@
 """FastAPI foundation for the remediation orchestrator, with secure GitHub webhook intake."""
 
+import asyncio
 import json
 import logging
 import os
@@ -9,7 +10,7 @@ from pathlib import Path
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from flow import dispatch
+from flow import dispatch, poll_loop
 from gh import verify_signature
 from store import close_connection, init_db, record_delivery
 
@@ -33,13 +34,49 @@ def _load_advisories() -> dict:
     return data
 
 
+def _build_polling_config() -> dict | None:
+    """Return a polling config dict if all required env vars are present,
+    else None. Polling only needs Devin/GitHub read access, not the full
+    dispatch configuration (no playbook_id or ACU limit required).
+    """
+    devin_api_key = os.environ.get("DEVIN_API_KEY", "")
+    devin_org_id = os.environ.get("DEVIN_ORG_ID", "")
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    github_repo = os.environ.get("GITHUB_REPO", "")
+
+    if not devin_api_key or not devin_org_id or not github_token or not github_repo:
+        return None
+
+    return {
+        "devin_api_key": devin_api_key,
+        "devin_org_id": devin_org_id,
+        "github_token": github_token,
+        "github_repo": github_repo,
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.advisories = _load_advisories()
     init_db()
+
+    polling_config = _build_polling_config()
+    poll_task = None
+    if polling_config is not None:
+        poll_task = asyncio.create_task(poll_loop(polling_config))
+        logger.info("polling task started")
+    else:
+        logger.warning("polling disabled: missing DEVIN_API_KEY, DEVIN_ORG_ID, GITHUB_TOKEN, or GITHUB_REPO")
+
     try:
         yield
     finally:
+        if poll_task is not None:
+            poll_task.cancel()
+            try:
+                await poll_task
+            except asyncio.CancelledError:
+                pass
         close_connection()
 
 

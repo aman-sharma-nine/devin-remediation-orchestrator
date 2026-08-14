@@ -59,11 +59,30 @@ Dispatch is idempotent at the issue level: two label events for the same
 issue create only one Devin session, regardless of delivery replay or manual
 re-triggering.
 
-Polling, PR detection, CI verification, and repair cycles are deferred to
-Step 9.
+## PR discovery polling (Step 9)
+
+While a session is `dispatched` or `working`, a background task polls Devin
+every 15 seconds to check whether it has opened a pull request. Polling
+resumes automatically from SQLite after a service restart — any row still
+in `dispatched` or `working` state is picked back up on the next poll.
+
+Once a PR appears, the orchestrator:
+1. Fetches the PR's current head commit SHA from GitHub.
+2. Stores `pr_url` and `head_sha` on the session row.
+3. Sets `outcome=awaiting_ci` and `phase=pr_discovered`.
+
+A row with `outcome=awaiting_ci` is no longer polled — Devin finishing a
+session is never treated as verification. Step 9 stops at `awaiting_ci`;
+only Step 10's independent CI check can mark a remediation `verified`.
+
+Polling requires `DEVIN_API_KEY`, `DEVIN_ORG_ID`, `GITHUB_TOKEN`, and
+`GITHUB_REPO`. If any are missing, polling is disabled with a log message
+and the rest of the service continues to run normally.
+
+CI verification and the repair cycle are deferred to Step 10.
 
 Run the tests:
 
 ```bash
-python -m unittest -v test_webhook.py test_dispatch.py
+python -m unittest -v test_webhook.py test_dispatch.py test_polling.py
 ```

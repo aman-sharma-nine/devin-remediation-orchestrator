@@ -98,3 +98,95 @@ async def create_session(
 
     logger.info("created Devin session %s", session_id)
     return session_id, session_url
+
+
+async def get_session(
+    api_key: str,
+    org_id: str,
+    session_id: str,
+    client: httpx.AsyncClient | None = None,
+) -> dict:
+    """Fetch a Devin v3 session's current status and pull requests.
+
+    Args:
+        api_key: Devin API key (Bearer token)
+        org_id: Devin organization ID
+        session_id: Devin session ID, exactly as returned by create_session
+        client: Optional httpx.AsyncClient for testing; not closed by this function
+
+    Returns:
+        Dict with keys: status, status_detail, pull_requests, acus_consumed.
+        pull_requests is a list of {"pr_url": str, "pr_state": str}.
+
+    Raises:
+        DevinError: On API failure, network error, or validation failure
+    """
+    if not api_key:
+        raise DevinError("api_key is required")
+    if not org_id:
+        raise DevinError("org_id is required")
+    if not session_id or not session_id.strip():
+        raise DevinError("session_id must be non-empty")
+
+    url = f"https://api.devin.ai/v3/organizations/{org_id}/sessions/{session_id}"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+    }
+
+    should_close = False
+    if client is None:
+        client = httpx.AsyncClient(timeout=30.0)
+        should_close = True
+
+    try:
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise DevinError(f"Devin API error: HTTP {exc.response.status_code}") from exc
+    except (httpx.RequestError, httpx.TimeoutException) as exc:
+        raise DevinError(f"Devin API request failed: {type(exc).__name__}") from exc
+    finally:
+        if should_close:
+            await client.aclose()
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise DevinError("Devin API response was not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise DevinError("Devin API response was not a JSON object")
+
+    status = data.get("status")
+    if not isinstance(status, str) or not status.strip():
+        raise DevinError("Devin response missing or empty status")
+
+    status_detail = data.get("status_detail")
+    if status_detail is not None and not isinstance(status_detail, str):
+        raise DevinError("Devin response status_detail must be a string or null")
+
+    raw_pull_requests = data.get("pull_requests", [])
+    if not isinstance(raw_pull_requests, list):
+        raise DevinError("Devin response pull_requests must be a list")
+
+    pull_requests = []
+    for pr in raw_pull_requests:
+        if not isinstance(pr, dict):
+            raise DevinError("Devin response pull_requests entry must be an object")
+        pr_url = pr.get("pr_url")
+        pr_state = pr.get("pr_state")
+        if not isinstance(pr_url, str) or not pr_url.strip():
+            continue
+        pull_requests.append({"pr_url": pr_url, "pr_state": pr_state})
+
+    acus_consumed = data.get("acus_consumed")
+    if acus_consumed is not None and not isinstance(acus_consumed, (int, float)):
+        raise DevinError("Devin response acus_consumed must be numeric or null")
+
+    return {
+        "status": status,
+        "status_detail": status_detail,
+        "pull_requests": pull_requests,
+        "acus_consumed": acus_consumed,
+    }

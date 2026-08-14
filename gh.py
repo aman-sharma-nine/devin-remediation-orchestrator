@@ -2,6 +2,7 @@
 
 import hashlib
 import hmac
+import re
 import httpx
 import logging
 
@@ -82,3 +83,85 @@ async def add_issue_label(
             await client.aclose()
 
     logger.info("added label %s to %s#%d", label, repo, issue_number)
+
+
+_PR_URL_RE = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)/?$")
+
+
+async def get_pull_request_head_sha(
+    github_repo: str,
+    pr_url: str,
+    token: str,
+    client: httpx.AsyncClient | None = None,
+) -> str:
+    """Fetch the current head commit SHA of a GitHub pull request.
+
+    Args:
+        github_repo: The expected "owner/repo" the PR must belong to
+        pr_url: Full GitHub PR URL, e.g. https://github.com/owner/repo/pull/5
+        token: GitHub API token (used as Bearer token)
+        client: Optional httpx.AsyncClient for testing; not closed by this function
+
+    Returns:
+        The PR's current head commit SHA.
+
+    Raises:
+        GitHubError: On a malformed URL, repository mismatch, API failure,
+            missing SHA, or validation failure.
+    """
+    if not github_repo or not github_repo.strip():
+        raise GitHubError("github_repo must be non-empty")
+    if not pr_url or not pr_url.strip():
+        raise GitHubError("pr_url must be non-empty")
+    if not token or not token.strip():
+        raise GitHubError("token must be non-empty")
+
+    match = _PR_URL_RE.match(pr_url.strip())
+    if not match:
+        raise GitHubError("pr_url is not a well-formed GitHub pull request URL")
+
+    pr_repo, pr_number_str = match.group(1), match.group(2)
+    if pr_repo != github_repo:
+        raise GitHubError("pr_url does not belong to the configured repository")
+
+    pr_number = int(pr_number_str)
+
+    url = f"https://api.github.com/repos/{github_repo}/pulls/{pr_number}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+    should_close = False
+    if client is None:
+        client = httpx.AsyncClient(timeout=30.0)
+        should_close = True
+
+    try:
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise GitHubError(f"GitHub API error: HTTP {exc.response.status_code}") from exc
+    except (httpx.RequestError, httpx.TimeoutException) as exc:
+        raise GitHubError(f"GitHub API request failed: {type(exc).__name__}") from exc
+    finally:
+        if should_close:
+            await client.aclose()
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise GitHubError("GitHub API response was not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise GitHubError("GitHub API response was not a JSON object")
+
+    head = data.get("head")
+    if not isinstance(head, dict):
+        raise GitHubError("GitHub API response missing head object")
+
+    sha = head.get("sha")
+    if not isinstance(sha, str) or not sha.strip():
+        raise GitHubError("GitHub API response missing head.sha")
+
+    return sha

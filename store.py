@@ -182,6 +182,124 @@ def get_session_by_issue(issue_number: int) -> dict | None:
         return dict(row)
 
 
+def list_pollable_sessions() -> list[dict]:
+    """Return rows that still need Devin polling.
+
+    A row is pollable when it has a non-empty session_id and its outcome
+    is "dispatched" or "working" (not yet awaiting_ci, blocked, needs_human,
+    verified, or repairing).
+    """
+    with _lock:
+        if _conn is None:
+            raise RuntimeError("database connection has not been initialized")
+
+        cursor = _conn.execute(
+            """
+            SELECT * FROM sessions
+            WHERE session_id IS NOT NULL AND session_id != ''
+              AND outcome IN ('dispatched', 'working')
+            """
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def update_polling_state(
+    issue_number: int,
+    outcome: str,
+    phase: str,
+    acus_consumed: float | None = None,
+) -> bool:
+    """Update outcome/phase/acus_consumed for a polled session.
+
+    Writes and commits only if at least one value actually changed.
+    Returns True if a write occurred, False if the row already matched.
+
+    Raises RuntimeError if no row exists for the issue.
+    """
+    if not isinstance(issue_number, int) or isinstance(issue_number, bool):
+        raise ValueError("issue_number must be an integer")
+    if not outcome or not outcome.strip():
+        raise ValueError("outcome must be non-empty")
+    if not phase or not phase.strip():
+        raise ValueError("phase must be non-empty")
+
+    with _lock:
+        if _conn is None:
+            raise RuntimeError("database connection has not been initialized")
+
+        cursor = _conn.execute(
+            "SELECT outcome, phase, acus_consumed FROM sessions WHERE issue_number = ?",
+            (issue_number,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError(f"no row found for issue {issue_number}")
+
+        if row["outcome"] == outcome and row["phase"] == phase and row["acus_consumed"] == acus_consumed:
+            return False
+
+        _conn.execute(
+            "UPDATE sessions SET outcome = ?, phase = ?, acus_consumed = ? WHERE issue_number = ?",
+            (outcome, phase, acus_consumed, issue_number),
+        )
+        _conn.commit()
+        return True
+
+
+def record_pr_discovered(
+    issue_number: int,
+    pr_url: str,
+    head_sha: str,
+    acus_consumed: float | None = None,
+) -> bool:
+    """Record PR discovery: store pr_url, head_sha, set outcome=awaiting_ci,
+    phase=pr_discovered.
+
+    Writes and commits only if at least one value actually changed.
+    Returns True if a write occurred, False if the row already matched.
+
+    Raises RuntimeError if no row exists for the issue.
+    """
+    if not isinstance(issue_number, int) or isinstance(issue_number, bool):
+        raise ValueError("issue_number must be an integer")
+    if not pr_url or not pr_url.strip():
+        raise ValueError("pr_url must be non-empty")
+    if not head_sha or not head_sha.strip():
+        raise ValueError("head_sha must be non-empty")
+
+    with _lock:
+        if _conn is None:
+            raise RuntimeError("database connection has not been initialized")
+
+        cursor = _conn.execute(
+            "SELECT pr_url, head_sha, outcome, phase, acus_consumed FROM sessions WHERE issue_number = ?",
+            (issue_number,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError(f"no row found for issue {issue_number}")
+
+        if (
+            row["pr_url"] == pr_url
+            and row["head_sha"] == head_sha
+            and row["outcome"] == "awaiting_ci"
+            and row["phase"] == "pr_discovered"
+            and row["acus_consumed"] == acus_consumed
+        ):
+            return False
+
+        _conn.execute(
+            """
+            UPDATE sessions
+            SET pr_url = ?, head_sha = ?, outcome = ?, phase = ?, acus_consumed = ?
+            WHERE issue_number = ?
+            """,
+            (pr_url, head_sha, "awaiting_ci", "pr_discovered", acus_consumed, issue_number),
+        )
+        _conn.commit()
+        return True
+
+
 def close_connection():
     global _conn
     with _lock:
