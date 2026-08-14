@@ -1,18 +1,87 @@
 # devin-remediation-orchestrator
 
-## Setup
+## 1. Overview
 
-Requires Python 3.11+.
+A small FastAPI service that turns one curated GitHub security advisory into
+a fully independently-verified remediation, using Devin to do the work and
+GitHub Actions — not Devin — to decide whether it succeeded.
+
+Hero flow:
+
+```text
+devin-remediate label on a curated issue
+  → signed webhook accepted
+  → issue claimed once in SQLite
+  → one Devin v3 session created
+  → session polled until it opens a draft PR
+  → PR head SHA recorded
+  → verify-remediation CI runs on that PR
+  → workflow_run webhook received
+  → CI success (and untouched verifier files) → outcome=verified
+  → CI failure → one repair message to the same session, then re-verify
+  → second failure → needs_human, no further automation
+  → dashboard shows live totals: dispatched / PRs opened / CI verified
+```
+
+## 2. Prerequisites
+
+- **Python 3.11+** — to run the service directly.
+- **Docker with Compose** — to run it containerized (`docker compose` v2
+  syntax, i.e. no separate `docker-compose` binary needed).
+- **GitHub CLI (`gh`)** — only needed for local webhook forwarding during a
+  live demo (`gh webhook forward`); not required to run the service itself.
+- **Real GitHub and Devin API access** — only needed for the live one-issue
+  demo (section 7). Everything else (startup, dashboard, the full test
+  suite) works with empty credentials.
+
+## 3. Environment variables
+
+All variables live in `.env.example` (safe to commit — no real values) and
+are loaded into `.env` (git-ignored) for local use.
+
+**The service itself requires no credentials to start.** `/health`, `/`,
+and `/api/metrics` all work with every variable empty. Configuration is
+only needed once you exercise a specific capability, layered as follows:
+
+- **Service startup** — no credentials required.
+- **Webhook intake** (`POST /webhook/github` accepting a request at all) —
+  `WEBHOOK_SECRET`, `GITHUB_REPO`, `APPROVED_ACTORS`.
+- **Dispatch** (creating a Devin session from a curated `issues` label
+  event) — GitHub and Devin credentials, plus the Playbook ID and ACU
+  limit: `GITHUB_TOKEN`, `DEVIN_API_KEY`, `DEVIN_ORG_ID`,
+  `DEVIN_PLAYBOOK_ID`, `DEVIN_MAX_ACU_LIMIT`.
+- **Polling** (the background task that discovers a session's PR) —
+  `DEVIN_API_KEY`, `DEVIN_ORG_ID`, `GITHUB_TOKEN`, `GITHUB_REPO`.
+- **Verification / repair** (handling a `workflow_run` event) — the
+  verification workflow name plus GitHub/Devin configuration:
+  `VERIFY_WORKFLOW_NAME`, `GITHUB_TOKEN`, `DEVIN_API_KEY`, `DEVIN_ORG_ID`,
+  `GITHUB_REPO`.
+
+| Variable | Controls | Required for |
+|---|---|---|
+| `DATABASE_PATH` | Path to the SQLite file | Optional — defaults to `./orchestrator.db` if unset |
+| `WEBHOOK_SECRET` | HMAC-SHA256 signature verification on `POST /webhook/github` | Webhook intake — the endpoint returns `503` without it |
+| `GITHUB_REPO` | The only repository (`owner/name`) accepted from webhook payloads | Webhook intake, dispatch, polling, verification |
+| `APPROVED_ACTORS` | Comma-separated GitHub usernames allowed to trigger remediation via the `issues` event | Webhook intake — the endpoint returns `503` without it |
+| `GITHUB_TOKEN` | GitHub API bearer token | Dispatch (adding the `devin-in-progress` label), polling (reading PR head SHA), verification (listing PR files) |
+| `DEVIN_API_KEY` | Devin v3 API bearer token | Dispatch (creating a session), polling (reading session status), repair (sending a message) |
+| `DEVIN_ORG_ID` | Devin organization ID | Same calls as `DEVIN_API_KEY`, always used together |
+| `DEVIN_PLAYBOOK_ID` | Devin remediation Playbook ID attached to each session | Dispatch only |
+| `DEVIN_MAX_ACU_LIMIT` | Positive integer ACU budget per session | Dispatch only |
+| `VERIFY_WORKFLOW_NAME` | The `workflow_run.name` the verification handler filters on | Verification — a `workflow_run` event with a different name is ignored |
+| `VERIFY_CHECK_NAME` | Documents the GitHub check-run name expected on the fork, for setup/manual confirmation | **Not read by the runtime.** Kept for engineers wiring up the fork's Actions workflow to confirm the check-run name matches what a reviewer expects to see in the GitHub UI. |
+
+## 4. Run locally
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
+if [ ! -f .env ]; then cp .env.example .env; fi
 ```
 
-Edit `.env` with real values, then export them into your shell (or use a tool
-that sources `.env` for you), for example:
+Edit `.env` with real values only if you intend to run the live demo (all
+fields can stay empty otherwise). Load it into your shell:
 
 ```bash
 set -a
@@ -20,123 +89,148 @@ source .env
 set +a
 ```
 
-## Running
+Start the service:
 
 ```bash
 uvicorn app:app --reload
 ```
 
-Check the service is up:
+Check it's up:
 
 ```bash
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/health          # {"status":"ok"}
+curl http://127.0.0.1:8000/api/metrics     # dashboard data as JSON
+open http://127.0.0.1:8000/                # dashboard UI
 ```
 
-## Webhook intake and dispatch (Steps 7–8)
-
-`POST /webhook/github` authenticates GitHub webhook deliveries and
-schedules a Devin session for curated issues:
-
-- `WEBHOOK_SECRET` must match the secret configured on the GitHub webhook;
-  requests are verified with an HMAC-SHA256 signature over the raw body.
-- `GITHUB_REPO` is the only repository (`owner/name`) accepted; all other
-  repositories are rejected.
-- `APPROVED_ACTORS` is a comma-separated allowlist of GitHub usernames
-  permitted to trigger remediation.
-
-On a valid `devin-remediate` label event for a curated issue:
-1. The issue is reserved in SQLite (`sessions.issue_number` UNIQUE).
-2. A Devin v3 session is created with the advisory-specific prompt.
-3. The session ID and URL are stored.
-4. The `devin-in-progress` label is added to the GitHub issue.
-
-Curated issues are defined in `advisories.json`, keyed by issue number,
-containing only trusted advisory metadata — never issue title, body, or
-comments. This prevents prompt injection and ensures consistent remediation
-across issues.
-
-Dispatch is idempotent at the issue level: two label events for the same
-issue create only one Devin session, regardless of delivery replay or manual
-re-triggering.
-
-## PR discovery polling (Step 9)
-
-While a session is `dispatched`, `working`, or `repairing`, a background
-task polls every 15 seconds to check on it. Polling resumes automatically
-from SQLite after a service restart — any row still in one of those states
-is picked back up on the next poll.
-
-For `dispatched`/`working` rows, polling calls Devin's session status. Once
-a PR appears, the orchestrator:
-1. Fetches the PR's current head commit SHA from GitHub.
-2. Stores `pr_url` and `head_sha` on the session row.
-3. Sets `outcome=awaiting_ci` and `phase=pr_discovered`.
-
-For `repairing` rows (see Step 10 below), polling instead compares GitHub's
-live PR head SHA against the row's stored (failed) `head_sha`. If they
-still match, Devin hasn't pushed a fix yet and the row is left unchanged.
-Once they differ, the new SHA is stored and the row re-enters the CI path
-with `outcome=awaiting_ci` and `phase=repair_pushed`.
-
-A row with `outcome=awaiting_ci` is no longer polled — Devin finishing a
-session is never treated as verification. Only Step 10's independent CI
-check can mark a remediation `verified`.
-
-Polling requires `DEVIN_API_KEY`, `DEVIN_ORG_ID`, `GITHUB_TOKEN`, and
-`GITHUB_REPO`. If any are missing, polling is disabled with a log message
-and the rest of the service continues to run normally.
-
-## CI verification and repair (Step 10)
-
-`POST /webhook/github` also receives `workflow_run` events on the same
-endpoint. Only events where the workflow name matches `VERIFY_WORKFLOW_NAME`
-and `action=completed` are processed. The run's `head_sha` is used to look
-up the matching session row — but only among rows with `outcome=awaiting_ci`,
-so a duplicate or stale event for an old failed SHA is ignored once a repair
-has started (see below).
-
-- **Success** — the PR's changed files are checked against a protected list
-  (`.github/workflows/verify-remediation.yml`, `scripts/assert_remediated.py`).
-  If neither was touched, the row is marked `outcome=verified`,
-  `phase=verified`, `check_state=green`, with `verified_at` set. If either
-  was touched, a green check is not trusted — the row is marked
-  `needs_human` instead.
-- **First failure** — the row is atomically marked `outcome=repairing` with
-  `repair_attempts=1`, and one message (PR URL, run URL, failed SHA) is sent
-  to the *same* Devin session. `head_sha` is intentionally **kept** (the
-  failed commit's SHA), not cleared — the Step 9 poller uses it to detect
-  when Devin pushes a different commit, at which point the row automatically
-  re-enters `awaiting_ci` with `phase=repair_pushed`. No new Devin session is
-  ever created for a repair.
-- If sending that repair message fails, the row is marked `needs_human` with
-  `phase=repair_message_failed` rather than being left stuck in `repairing`
-  forever.
-- **Second failure** — the row is marked `needs_human`. There is no second
-  repair attempt and no infinite retry loop.
-
-`workflow_run` events skip the actor allowlist (GitHub Actions is the
-sender, not a human), but still require a valid signature and the
-configured repository.
-
-## Dashboard (Step 11)
-
-- **Dashboard:** [http://localhost:8000/](http://localhost:8000/)
-- **Metrics endpoint:** [http://localhost:8000/api/metrics](http://localhost:8000/api/metrics)
-
-The page fetches `/api/metrics` once on load and every 5 seconds after,
-updating the totals, table, and "Last updated" time in place — no page
-reload. It shows three totals (**Dispatched**, **PRs opened**, **CI
-verified**) and one table with five columns: **Issue**, **Devin session**,
-**Pull request**, **Verification**, **Repair attempts**. Verification is
-shown as a readable badge (Verified / Awaiting CI / Repairing / Needs
-human / Pending); a missing link renders as an em dash.
-
-The dashboard is entirely read-only: it reports exactly what is already
-stored by Steps 7–10 and never writes to the database, creates a session,
-or triggers a webhook.
-
-Run the tests:
+## 5. Run with Docker
 
 ```bash
-python -m unittest -v test_webhook.py test_dispatch.py test_polling.py test_verification.py test_dashboard.py
+if [ ! -f .env ]; then cp .env.example .env; fi   # edit with real values only for the live demo
+docker compose up --build
 ```
+
+Then:
+
+- Dashboard: [http://localhost:8000/](http://localhost:8000/)
+- Health: [http://localhost:8000/health](http://localhost:8000/health)
+- Metrics: [http://localhost:8000/api/metrics](http://localhost:8000/api/metrics)
+
+Stop it cleanly:
+
+```bash
+docker compose down
+```
+
+SQLite is stored in a named Docker volume (`orchestrator-data`, mounted at
+`/data` inside the container, with `DATABASE_PATH=/data/orchestrator.db`),
+so data persists across `docker compose up`/`down` cycles but lives outside
+the image and outside the repository working tree. `ORCHESTRATOR_PORT` and
+`ORCHESTRATOR_ENV_FILE` can override the published port and the env file
+used, e.g.:
+
+```bash
+ORCHESTRATOR_ENV_FILE=.env.example ORCHESTRATOR_PORT=18000 docker compose up --build
+```
+
+## 6. Safe simulation
+
+Every webhook path, dispatch, polling transition, verification outcome, and
+repair branch is covered by mocked unit tests — no test ever calls GitHub
+or Devin. The test suite forces `DATABASE_PATH` to a temporary test
+location and never opens or modifies the live `orchestrator.db`.
+
+```bash
+python -m unittest -v \
+  test_webhook.py \
+  test_dispatch.py \
+  test_polling.py \
+  test_verification.py \
+  test_dashboard.py
+```
+
+62 tests, all passing, no network access required.
+
+## 7. One-issue live demo
+
+This is the only path that touches real GitHub and Devin infrastructure —
+**it creates a real Devin session and consumes account quota.**
+
+Prerequisites: `verify-remediation.yml` and `scripts/assert_remediated.py`
+already on the fork's default branch, and issue #1 in
+`aman-sharma-nine/superset` exists with an entry in `advisories.json`.
+
+1. Start the service (locally or via Docker) with real credentials loaded.
+2. In a separate terminal, load `.env` into **that** shell too, then start
+   forwarding for both event types:
+
+   ```bash
+   set -a
+   source .env
+   set +a
+
+   gh webhook forward \
+     --repo=aman-sharma-nine/superset \
+     --events=issues,workflow_run \
+     --url=http://localhost:8000/webhook/github \
+     --secret="$WEBHOOK_SECRET"
+   ```
+
+   This `source .env` step is required in the forwarding terminal even when
+   the service itself is running inside Docker — `gh webhook forward` reads
+   `WEBHOOK_SECRET` from its own shell environment, not from the
+   container's.
+
+3. Add the label **exactly once**:
+
+   ```bash
+   gh issue edit 1 --repo aman-sharma-nine/superset --add-label devin-remediate
+   ```
+
+4. Watch [http://localhost:8000/](http://localhost:8000/) — the dashboard
+   moves from `Dispatched: 1` → `PRs opened: 1` → `CI verified: 1` as the
+   session progresses, with no page reload.
+
+## 8. Security controls
+
+- **HMAC-SHA256 webhook verification** — every request to
+  `POST /webhook/github` is checked with `hmac.compare_digest` against
+  `WEBHOOK_SECRET` before any payload is parsed.
+- **Repository allowlist** — only `GITHUB_REPO` is accepted; every other
+  `repository.full_name` is rejected.
+- **Actor allowlist** — only senders in `APPROVED_ACTORS` can trigger
+  remediation via the `issues` event (`workflow_run` events, raised by
+  GitHub Actions rather than a human, skip this check but still require a
+  valid signature and the configured repository).
+- **Trusted prompt input** — the Devin prompt is built only from
+  `advisories.json`; issue title, body, and comments are never read,
+  removing a prompt-injection surface.
+- **Delivery idempotency** — `deliveries.delivery_id` is UNIQUE, so a
+  redelivered webhook is a no-op.
+- **Issue-level idempotency** — `sessions.issue_number` is UNIQUE and
+  claimed atomically before any external API call, so at most one Devin
+  session is ever created per issue.
+- **No credential leakage** — handled GitHub and Devin API errors record
+  only safe status/type information; authorization headers and response
+  bodies are not logged, stored, or returned by `/api/metrics`.
+- **Protected verifier files** — on a green check, the PR's changed files
+  are checked against `.github/workflows/verify-remediation.yml` and
+  `scripts/assert_remediated.py`; a PR that touched either is marked
+  `needs_human` instead of `verified`, because a green check on a PR that
+  edited its own gate proves nothing.
+- **Independent CI verification** — `outcome=verified` is set only by a
+  `workflow_run` webhook reporting `conclusion=success`, never by Devin's
+  own session status.
+- **One repair maximum** — a CI failure triggers exactly one repair message
+  to the original session (never a new one); a second failure on the
+  repaired commit goes straight to `needs_human` with no retry loop.
+
+## 9. Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| `POST /webhook/github` returns `503` | Missing `WEBHOOK_SECRET`, `GITHUB_REPO`, or `APPROVED_ACTORS` (or, for the `issues` branch specifically, missing dispatch config: `GITHUB_TOKEN`, `DEVIN_API_KEY`, `DEVIN_ORG_ID`, `DEVIN_PLAYBOOK_ID`, `DEVIN_MAX_ACU_LIMIT`) |
+| Devin returns `403` on session create or read | Check remaining account quota, that the service-user/API key has session-create permission (not just view), that `DEVIN_ORG_ID` matches the key's organization, and that the key hasn't been rotated or revoked |
+| No webhook deliveries arrive at all | Confirm `gh webhook forward` is actually running (it blocks the terminal — a closed/exited process delivers nothing) and check for a stale hook left over from a previous forwarding session blocking new hook registration (`gh api repos/<repo>/hooks`) |
+| Startup logs "polling disabled" | One or more of `DEVIN_API_KEY`, `DEVIN_ORG_ID`, `GITHUB_TOKEN`, `GITHUB_REPO` is empty — the rest of the service still runs normally |
+| The same label event appears to do nothing twice | Expected — `claim_session()` is the issue-level idempotency boundary; a duplicate delivery or repeated label toggle for an issue that already has a session is a deliberate no-op, not a bug |

@@ -5,4 +5,5 @@ __pycache__/
 *.db
 *.db-shm
 *.db-wal
+step12-demo.db.backup-*
 .pytest_cache/
