@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from flow import dispatch, poll_loop
+from flow import dispatch, poll_loop, handle_workflow_run
 from gh import verify_signature
 from store import close_connection, init_db, record_delivery
 
@@ -138,6 +138,31 @@ def _validate_dispatch_config() -> tuple[dict, str | None]:
     return config, None
 
 
+def _validate_verify_config() -> tuple[dict, str | None]:
+    """Validate configuration needed to handle a workflow_run verification
+    event. Returns (config_dict, error_message).
+    """
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    if not github_token:
+        return {}, "GITHUB_TOKEN not configured"
+
+    devin_api_key = os.environ.get("DEVIN_API_KEY", "")
+    if not devin_api_key:
+        return {}, "DEVIN_API_KEY not configured"
+
+    devin_org_id = os.environ.get("DEVIN_ORG_ID", "")
+    if not devin_org_id:
+        return {}, "DEVIN_ORG_ID not configured"
+
+    config = {
+        "github_repo": os.environ.get("GITHUB_REPO", ""),
+        "github_token": github_token,
+        "devin_api_key": devin_api_key,
+        "devin_org_id": devin_org_id,
+    }
+    return config, None
+
+
 @app.post("/webhook/github")
 async def webhook_github(request: Request, background_tasks: BackgroundTasks):
     webhook_secret = os.environ.get("WEBHOOK_SECRET", "")
@@ -179,7 +204,9 @@ async def webhook_github(request: Request, background_tasks: BackgroundTasks):
         return JSONResponse(status_code=403, content={"detail": "repository not allowed"})
 
     sender_login = payload.get("sender", {}).get("login") if isinstance(payload.get("sender"), dict) else None
-    if sender_login not in approved_actors:
+    # workflow_run events are raised by GitHub Actions, not a human actor,
+    # so the actor allowlist only applies to the "issues" trigger.
+    if event_name != "workflow_run" and sender_login not in approved_actors:
         logger.warning("rejected delivery %s: actor not allowed", delivery_id)
         return JSONResponse(status_code=403, content={"detail": "actor not allowed"})
 
@@ -189,6 +216,35 @@ async def webhook_github(request: Request, background_tasks: BackgroundTasks):
         return _ignored("duplicate_delivery")
 
     logger.info("accepted delivery %s", delivery_id)
+
+    if event_name == "workflow_run":
+        verify_workflow_name = os.environ.get("VERIFY_WORKFLOW_NAME", "")
+        workflow_run = payload.get("workflow_run") if isinstance(payload.get("workflow_run"), dict) else None
+        wf_name = workflow_run.get("name") if workflow_run else None
+
+        if not verify_workflow_name or wf_name != verify_workflow_name:
+            return _ignored("irrelevant_workflow")
+
+        if payload.get("action") != "completed":
+            return _ignored("workflow_not_completed")
+
+        head_sha = workflow_run.get("head_sha")
+        if not isinstance(head_sha, str) or not head_sha:
+            logger.warning("rejected delivery %s: missing head_sha", delivery_id)
+            return JSONResponse(status_code=400, content={"detail": "missing head_sha"})
+
+        conclusion = workflow_run.get("conclusion")
+        run_url = workflow_run.get("html_url", "")
+
+        config, error = _validate_verify_config()
+        if error:
+            logger.warning("rejected: verification configuration invalid: %s", error)
+            return JSONResponse(status_code=503, content={"detail": "server not configured"})
+
+        background_tasks.add_task(handle_workflow_run, head_sha, conclusion, run_url, config)
+
+        logger.info("accepted workflow_run delivery %s, scheduled verification", delivery_id)
+        return JSONResponse(status_code=202, content={"status": "accepted"})
 
     if event_name != "issues":
         return _ignored("unsupported_event")

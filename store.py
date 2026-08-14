@@ -186,8 +186,9 @@ def list_pollable_sessions() -> list[dict]:
     """Return rows that still need Devin polling.
 
     A row is pollable when it has a non-empty session_id and its outcome
-    is "dispatched" or "working" (not yet awaiting_ci, blocked, needs_human,
-    verified, or repairing).
+    is "dispatched", "working", or "repairing" (not yet awaiting_ci,
+    blocked, needs_human, or verified). "repairing" rows are included so
+    the poller can detect when Devin pushes a new commit during a repair.
     """
     with _lock:
         if _conn is None:
@@ -197,7 +198,7 @@ def list_pollable_sessions() -> list[dict]:
             """
             SELECT * FROM sessions
             WHERE session_id IS NOT NULL AND session_id != ''
-              AND outcome IN ('dispatched', 'working')
+              AND outcome IN ('dispatched', 'working', 'repairing')
             """
         )
         return [dict(row) for row in cursor.fetchall()]
@@ -295,6 +296,208 @@ def record_pr_discovered(
             WHERE issue_number = ?
             """,
             (pr_url, head_sha, "awaiting_ci", "pr_discovered", acus_consumed, issue_number),
+        )
+        _conn.commit()
+        return True
+
+
+def get_session_by_head_sha(head_sha: str) -> dict | None:
+    """Retrieve a session row by its stored head_sha, restricted to rows
+    currently awaiting CI (outcome=awaiting_ci).
+
+    This scoping matters once a repair starts: the failed SHA stays stored
+    on the row while outcome=repairing (see start_repair), so a duplicate
+    or stale workflow_run event for that same failed SHA must not match
+    and re-trigger handling while the row is mid-repair.
+
+    Returns the row as a plain dictionary, or None if not found.
+    """
+    if not head_sha or not head_sha.strip():
+        raise ValueError("head_sha must be non-empty")
+
+    with _lock:
+        if _conn is None:
+            raise RuntimeError("database connection has not been initialized")
+
+        cursor = _conn.execute(
+            "SELECT * FROM sessions WHERE head_sha = ? AND outcome = 'awaiting_ci'",
+            (head_sha,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+
+def mark_verified(issue_number: int) -> bool:
+    """Mark a session verified: outcome=verified, phase=verified,
+    check_state=green, verified_at=now.
+
+    No-op (returns False) if the row is already verified, so a duplicate
+    workflow_run delivery does not overwrite verified_at.
+
+    Raises RuntimeError if no row exists for the issue.
+    """
+    if not isinstance(issue_number, int) or isinstance(issue_number, bool):
+        raise ValueError("issue_number must be an integer")
+
+    verified_at = datetime.now(timezone.utc).isoformat()
+
+    with _lock:
+        if _conn is None:
+            raise RuntimeError("database connection has not been initialized")
+
+        cursor = _conn.execute(
+            "SELECT outcome FROM sessions WHERE issue_number = ?",
+            (issue_number,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError(f"no row found for issue {issue_number}")
+
+        if row["outcome"] == "verified":
+            return False
+
+        _conn.execute(
+            """
+            UPDATE sessions
+            SET outcome = 'verified', phase = 'verified', check_state = 'green', verified_at = ?
+            WHERE issue_number = ?
+            """,
+            (verified_at, issue_number),
+        )
+        _conn.commit()
+        return True
+
+
+def mark_needs_human(issue_number: int, phase: str, note: str, check_state: str) -> bool:
+    """Mark a session needs_human with a specific phase/note/check_state.
+
+    Writes and commits only if at least one value actually changed.
+    Returns True if a write occurred, False if the row already matched.
+
+    Raises RuntimeError if no row exists for the issue.
+    """
+    if not isinstance(issue_number, int) or isinstance(issue_number, bool):
+        raise ValueError("issue_number must be an integer")
+    if not phase or not phase.strip():
+        raise ValueError("phase must be non-empty")
+    if not note or not note.strip():
+        raise ValueError("note must be non-empty")
+    if not check_state or not check_state.strip():
+        raise ValueError("check_state must be non-empty")
+
+    with _lock:
+        if _conn is None:
+            raise RuntimeError("database connection has not been initialized")
+
+        cursor = _conn.execute(
+            "SELECT outcome, phase, note, check_state FROM sessions WHERE issue_number = ?",
+            (issue_number,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError(f"no row found for issue {issue_number}")
+
+        if (
+            row["outcome"] == "needs_human"
+            and row["phase"] == phase
+            and row["note"] == note
+            and row["check_state"] == check_state
+        ):
+            return False
+
+        _conn.execute(
+            """
+            UPDATE sessions
+            SET outcome = 'needs_human', phase = ?, note = ?, check_state = ?
+            WHERE issue_number = ?
+            """,
+            (phase, note, check_state, issue_number),
+        )
+        _conn.commit()
+        return True
+
+
+def start_repair(issue_number: int) -> bool:
+    """Atomically start the single allowed repair attempt.
+
+    Sets repair_attempts=1, outcome=repairing, phase=repairing,
+    check_state=failed. head_sha is intentionally KEPT (not cleared) -
+    it holds the failed commit's SHA so the Step 9 poller can compare it
+    against GitHub's live PR head SHA and detect when Devin pushes a new
+    commit (see record_repair_pushed).
+
+    The WHERE repair_attempts = 0 guard makes this atomic against a
+    duplicate workflow_run delivery: only the first caller succeeds.
+
+    Returns True if repair was started, False if a repair was already
+    in progress or already attempted.
+    """
+    if not isinstance(issue_number, int) or isinstance(issue_number, bool):
+        raise ValueError("issue_number must be an integer")
+
+    with _lock:
+        if _conn is None:
+            raise RuntimeError("database connection has not been initialized")
+
+        cursor = _conn.execute(
+            """
+            UPDATE sessions
+            SET repair_attempts = 1, outcome = 'repairing', phase = 'repairing',
+                check_state = 'failed'
+            WHERE issue_number = ? AND repair_attempts = 0
+            """,
+            (issue_number,),
+        )
+        _conn.commit()
+        return cursor.rowcount == 1
+
+
+def record_repair_pushed(issue_number: int, head_sha: str) -> bool:
+    """Record that Devin pushed a new commit during repair.
+
+    Updates head_sha to the new SHA and sets outcome=awaiting_ci,
+    phase=repair_pushed, check_state=absent, so the row re-enters the
+    normal CI-verification path via the new commit.
+
+    Writes and commits only if at least one value actually changed.
+    Returns True if a write occurred, False if the row already matched.
+
+    Raises RuntimeError if no row exists for the issue.
+    """
+    if not isinstance(issue_number, int) or isinstance(issue_number, bool):
+        raise ValueError("issue_number must be an integer")
+    if not head_sha or not head_sha.strip():
+        raise ValueError("head_sha must be non-empty")
+
+    with _lock:
+        if _conn is None:
+            raise RuntimeError("database connection has not been initialized")
+
+        cursor = _conn.execute(
+            "SELECT head_sha, outcome, phase, check_state FROM sessions WHERE issue_number = ?",
+            (issue_number,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError(f"no row found for issue {issue_number}")
+
+        if (
+            row["head_sha"] == head_sha
+            and row["outcome"] == "awaiting_ci"
+            and row["phase"] == "repair_pushed"
+            and row["check_state"] == "absent"
+        ):
+            return False
+
+        _conn.execute(
+            """
+            UPDATE sessions
+            SET head_sha = ?, outcome = 'awaiting_ci', phase = 'repair_pushed', check_state = 'absent'
+            WHERE issue_number = ?
+            """,
+            (head_sha, issue_number),
         )
         _conn.commit()
         return True

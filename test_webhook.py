@@ -28,6 +28,7 @@ os.environ["DEVIN_API_KEY"] = "fake-devin-key"
 os.environ["DEVIN_ORG_ID"] = "fake-org-id"
 os.environ["DEVIN_PLAYBOOK_ID"] = "fake-playbook-id"
 os.environ["DEVIN_MAX_ACU_LIMIT"] = "5"
+os.environ["VERIFY_WORKFLOW_NAME"] = "verify-remediation"
 
 import app as app_module  # noqa: E402  (env vars must be set before import)
 import flow  # noqa: E402
@@ -55,6 +56,22 @@ def _issue_payload(issue_number=1, label_name="devin-remediate", action="labeled
     return payload
 
 
+def _workflow_run_payload(name="verify-remediation", action="completed",
+                           conclusion="success", head_sha="a" * 40, repo=TEST_REPO):
+    payload = {
+        "action": action,
+        "repository": {"full_name": repo},
+        "sender": {"login": "github-actions[bot]"},
+        "workflow_run": {
+            "name": name,
+            "head_sha": head_sha,
+            "conclusion": conclusion,
+            "html_url": "https://github.com/" + repo + "/actions/runs/123",
+        },
+    }
+    return payload
+
+
 class WebhookTests(unittest.IsolatedAsyncioTestCase):
     _counter = 0
 
@@ -67,6 +84,9 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         self._dispatch_patcher = patch.object(app_module, "dispatch", new_callable=AsyncMock)
         self.mock_dispatch = self._dispatch_patcher.start()
 
+        self._workflow_run_patcher = patch.object(app_module, "handle_workflow_run", new_callable=AsyncMock)
+        self.mock_handle_workflow_run = self._workflow_run_patcher.start()
+
         self._lifespan_cm = app_module.app.router.lifespan_context(app_module.app)
         await self._lifespan_cm.__aenter__()
         transport = httpx.ASGITransport(app=app_module.app)
@@ -76,6 +96,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         await self.client.aclose()
         await self._lifespan_cm.__aexit__(None, None, None)
         self._dispatch_patcher.stop()
+        self._workflow_run_patcher.stop()
 
     def _row_count(self, delivery_id):
         cur = store._conn.execute(
@@ -293,6 +314,39 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(r.status_code, 503)
         finally:
             os.environ["WEBHOOK_SECRET"] = original
+
+    async def test_workflow_run_wrong_name_is_ignored(self):
+        delivery_id = self._delivery_id()
+        body = json.dumps(_workflow_run_payload(name="some-other-workflow")).encode()
+        r = await self._post(body, {
+            "X-Hub-Signature-256": _sign(body),
+            "X-GitHub-Delivery": delivery_id,
+            "X-GitHub-Event": "workflow_run",
+        })
+        self.assertEqual(r.status_code, 202)
+        self.assertEqual(r.json(), {"status": "ignored", "reason": "irrelevant_workflow"})
+        self.mock_handle_workflow_run.assert_not_awaited()
+
+    async def test_workflow_run_matching_and_completed_schedules_verification(self):
+        delivery_id = self._delivery_id()
+        body = json.dumps(_workflow_run_payload()).encode()
+        r = await self._post(body, {
+            "X-Hub-Signature-256": _sign(body),
+            "X-GitHub-Delivery": delivery_id,
+            "X-GitHub-Event": "workflow_run",
+        })
+        self.assertEqual(r.status_code, 202)
+        self.assertEqual(r.json(), {"status": "accepted"})
+        self.mock_handle_workflow_run.assert_awaited_once_with(
+            "a" * 40, "success", "https://github.com/" + TEST_REPO + "/actions/runs/123",
+            {
+                "github_repo": TEST_REPO,
+                "github_token": "fake-gh-token",
+                "devin_api_key": "fake-devin-key",
+                "devin_org_id": "fake-org-id",
+            },
+        )
+        self.mock_dispatch.assert_not_awaited()
 
 
 class LifespanRepeatTests(unittest.IsolatedAsyncioTestCase):

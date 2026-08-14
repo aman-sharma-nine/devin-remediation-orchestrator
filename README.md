@@ -61,28 +61,65 @@ re-triggering.
 
 ## PR discovery polling (Step 9)
 
-While a session is `dispatched` or `working`, a background task polls Devin
-every 15 seconds to check whether it has opened a pull request. Polling
-resumes automatically from SQLite after a service restart — any row still
-in `dispatched` or `working` state is picked back up on the next poll.
+While a session is `dispatched`, `working`, or `repairing`, a background
+task polls every 15 seconds to check on it. Polling resumes automatically
+from SQLite after a service restart — any row still in one of those states
+is picked back up on the next poll.
 
-Once a PR appears, the orchestrator:
+For `dispatched`/`working` rows, polling calls Devin's session status. Once
+a PR appears, the orchestrator:
 1. Fetches the PR's current head commit SHA from GitHub.
 2. Stores `pr_url` and `head_sha` on the session row.
 3. Sets `outcome=awaiting_ci` and `phase=pr_discovered`.
 
+For `repairing` rows (see Step 10 below), polling instead compares GitHub's
+live PR head SHA against the row's stored (failed) `head_sha`. If they
+still match, Devin hasn't pushed a fix yet and the row is left unchanged.
+Once they differ, the new SHA is stored and the row re-enters the CI path
+with `outcome=awaiting_ci` and `phase=repair_pushed`.
+
 A row with `outcome=awaiting_ci` is no longer polled — Devin finishing a
-session is never treated as verification. Step 9 stops at `awaiting_ci`;
-only Step 10's independent CI check can mark a remediation `verified`.
+session is never treated as verification. Only Step 10's independent CI
+check can mark a remediation `verified`.
 
 Polling requires `DEVIN_API_KEY`, `DEVIN_ORG_ID`, `GITHUB_TOKEN`, and
 `GITHUB_REPO`. If any are missing, polling is disabled with a log message
 and the rest of the service continues to run normally.
 
-CI verification and the repair cycle are deferred to Step 10.
+## CI verification and repair (Step 10)
+
+`POST /webhook/github` also receives `workflow_run` events on the same
+endpoint. Only events where the workflow name matches `VERIFY_WORKFLOW_NAME`
+and `action=completed` are processed. The run's `head_sha` is used to look
+up the matching session row — but only among rows with `outcome=awaiting_ci`,
+so a duplicate or stale event for an old failed SHA is ignored once a repair
+has started (see below).
+
+- **Success** — the PR's changed files are checked against a protected list
+  (`.github/workflows/verify-remediation.yml`, `scripts/assert_remediated.py`).
+  If neither was touched, the row is marked `outcome=verified`,
+  `phase=verified`, `check_state=green`, with `verified_at` set. If either
+  was touched, a green check is not trusted — the row is marked
+  `needs_human` instead.
+- **First failure** — the row is atomically marked `outcome=repairing` with
+  `repair_attempts=1`, and one message (PR URL, run URL, failed SHA) is sent
+  to the *same* Devin session. `head_sha` is intentionally **kept** (the
+  failed commit's SHA), not cleared — the Step 9 poller uses it to detect
+  when Devin pushes a different commit, at which point the row automatically
+  re-enters `awaiting_ci` with `phase=repair_pushed`. No new Devin session is
+  ever created for a repair.
+- If sending that repair message fails, the row is marked `needs_human` with
+  `phase=repair_message_failed` rather than being left stuck in `repairing`
+  forever.
+- **Second failure** — the row is marked `needs_human`. There is no second
+  repair attempt and no infinite retry loop.
+
+`workflow_run` events skip the actor allowlist (GitHub Actions is the
+sender, not a human), but still require a valid signature and the
+configured repository.
 
 Run the tests:
 
 ```bash
-python -m unittest -v test_webhook.py test_dispatch.py test_polling.py
+python -m unittest -v test_webhook.py test_dispatch.py test_polling.py test_verification.py
 ```

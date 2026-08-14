@@ -190,3 +190,57 @@ async def get_session(
         "pull_requests": pull_requests,
         "acus_consumed": acus_consumed,
     }
+
+
+async def send_message(
+    api_key: str,
+    org_id: str,
+    session_id: str,
+    message: str,
+    client: httpx.AsyncClient | None = None,
+) -> None:
+    """Send a follow-up message to an existing Devin v3 session.
+
+    Args:
+        api_key: Devin API key (Bearer token)
+        org_id: Devin organization ID
+        session_id: Devin session ID, exactly as returned by create_session
+        message: Message text to send to the session
+        client: Optional httpx.AsyncClient for testing; not closed by this function
+
+    Raises:
+        DevinError: On API failure, network error, or validation failure
+    """
+    if not api_key:
+        raise DevinError("api_key is required")
+    if not org_id:
+        raise DevinError("org_id is required")
+    if not session_id or not session_id.strip():
+        raise DevinError("session_id must be non-empty")
+    if not message or not message.strip():
+        raise DevinError("message must be non-empty")
+
+    url = f"https://api.devin.ai/v3/organizations/{org_id}/sessions/{session_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    request_body = {"message": message}
+
+    should_close = False
+    if client is None:
+        client = httpx.AsyncClient(timeout=30.0)
+        should_close = True
+
+    try:
+        response = await client.post(url, headers=headers, json=request_body)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise DevinError(f"Devin API error: HTTP {exc.response.status_code}") from exc
+    except (httpx.RequestError, httpx.TimeoutException) as exc:
+        raise DevinError(f"Devin API request failed: {type(exc).__name__}") from exc
+    finally:
+        if should_close:
+            await client.aclose()
+
+    logger.info("sent message to Devin session %s", session_id)
