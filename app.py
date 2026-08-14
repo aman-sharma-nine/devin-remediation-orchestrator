@@ -6,9 +6,10 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from flow import dispatch
 from gh import verify_signature
 from store import close_connection, init_db, record_delivery
 
@@ -58,8 +59,50 @@ def _parse_actors(raw: str) -> list[str]:
     return [actor.strip() for actor in raw.split(",") if actor.strip()]
 
 
+def _validate_dispatch_config() -> tuple[dict, str | None]:
+    """Validate dispatch configuration. Returns (config_dict, error_message)."""
+    config = {}
+
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    if not github_token:
+        return {}, "GITHUB_TOKEN not configured"
+
+    devin_api_key = os.environ.get("DEVIN_API_KEY", "")
+    if not devin_api_key:
+        return {}, "DEVIN_API_KEY not configured"
+
+    devin_org_id = os.environ.get("DEVIN_ORG_ID", "")
+    if not devin_org_id:
+        return {}, "DEVIN_ORG_ID not configured"
+
+    devin_playbook_id = os.environ.get("DEVIN_PLAYBOOK_ID", "")
+    if not devin_playbook_id:
+        return {}, "DEVIN_PLAYBOOK_ID not configured"
+
+    devin_max_acu_limit_raw = os.environ.get("DEVIN_MAX_ACU_LIMIT", "")
+    if not devin_max_acu_limit_raw:
+        return {}, "DEVIN_MAX_ACU_LIMIT not configured"
+
+    try:
+        devin_max_acu_limit = int(devin_max_acu_limit_raw)
+        if devin_max_acu_limit <= 0:
+            return {}, "DEVIN_MAX_ACU_LIMIT must be positive"
+    except ValueError:
+        return {}, "DEVIN_MAX_ACU_LIMIT must be a valid integer"
+
+    config = {
+        "github_repo": os.environ.get("GITHUB_REPO", ""),
+        "github_token": github_token,
+        "devin_api_key": devin_api_key,
+        "devin_org_id": devin_org_id,
+        "devin_playbook_id": devin_playbook_id,
+        "devin_max_acu_limit": devin_max_acu_limit,
+    }
+    return config, None
+
+
 @app.post("/webhook/github")
-async def webhook_github(request: Request):
+async def webhook_github(request: Request, background_tasks: BackgroundTasks):
     webhook_secret = os.environ.get("WEBHOOK_SECRET", "")
     github_repo = os.environ.get("GITHUB_REPO", "")
     approved_actors_raw = os.environ.get("APPROVED_ACTORS", "")
@@ -132,5 +175,13 @@ async def webhook_github(request: Request):
         logger.info("uncurated issue %s", issue_number)
         return _ignored("uncurated_issue")
 
-    logger.info("accepted curated issue %s", issue_number)
+    config, error = _validate_dispatch_config()
+    if error:
+        logger.warning("rejected: dispatch configuration invalid: %s", error)
+        return JSONResponse(status_code=503, content={"detail": "server not configured"})
+
+    advisory = advisories[str(issue_number)]
+    background_tasks.add_task(dispatch, issue_number, advisory, config)
+
+    logger.info("accepted curated issue %s, scheduled dispatch", issue_number)
     return JSONResponse(status_code=202, content={"status": "accepted", "issue_number": issue_number})

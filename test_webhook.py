@@ -10,6 +10,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -22,8 +23,14 @@ os.environ["DATABASE_PATH"] = str(Path(_tmp_dir.name) / "test.db")
 os.environ["WEBHOOK_SECRET"] = TEST_SECRET
 os.environ["GITHUB_REPO"] = TEST_REPO
 os.environ["APPROVED_ACTORS"] = TEST_ACTOR
+os.environ["GITHUB_TOKEN"] = "fake-gh-token"
+os.environ["DEVIN_API_KEY"] = "fake-devin-key"
+os.environ["DEVIN_ORG_ID"] = "fake-org-id"
+os.environ["DEVIN_PLAYBOOK_ID"] = "fake-playbook-id"
+os.environ["DEVIN_MAX_ACU_LIMIT"] = "5"
 
 import app as app_module  # noqa: E402  (env vars must be set before import)
+import flow  # noqa: E402
 import store  # noqa: E402
 
 
@@ -57,6 +64,9 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         return f"test-delivery-{cls._counter}"
 
     async def asyncSetUp(self):
+        self._dispatch_patcher = patch.object(app_module, "dispatch", new_callable=AsyncMock)
+        self.mock_dispatch = self._dispatch_patcher.start()
+
         self._lifespan_cm = app_module.app.router.lifespan_context(app_module.app)
         await self._lifespan_cm.__aenter__()
         transport = httpx.ASGITransport(app=app_module.app)
@@ -65,6 +75,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.client.aclose()
         await self._lifespan_cm.__aexit__(None, None, None)
+        self._dispatch_patcher.stop()
 
     def _row_count(self, delivery_id):
         cur = store._conn.execute(
@@ -91,6 +102,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 202)
         self.assertEqual(r.json(), {"status": "accepted", "issue_number": 1})
         self.assertEqual(self._row_count(delivery_id), 1)
+        self.mock_dispatch.assert_awaited_once()
 
     async def test_replaying_delivery_id_is_ignored_once_stored(self):
         delivery_id = self._delivery_id()
@@ -102,12 +114,14 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         }
         r1 = await self._post(body, headers)
         self.assertEqual(r1.status_code, 202)
+
         r2 = await self._post(body, headers)
         self.assertEqual(r2.status_code, 202)
         self.assertEqual(r2.json(), {"status": "ignored", "reason": "duplicate_delivery"})
         self.assertEqual(self._row_count(delivery_id), 1)
 
         self.assertFalse(store._conn.in_transaction)
+        self.mock_dispatch.assert_awaited_once()
 
         other_delivery_id = self._delivery_id()
         other_body = json.dumps(_issue_payload()).encode()
@@ -119,6 +133,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r3.status_code, 202)
         self.assertEqual(r3.json(), {"status": "accepted", "issue_number": 1})
         self.assertEqual(self._row_count(other_delivery_id), 1)
+        self.assertEqual(self.mock_dispatch.await_count, 2)
 
     async def test_signed_non_object_json_root_is_rejected_and_not_stored(self):
         delivery_id = self._delivery_id()
@@ -203,6 +218,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(r.status_code, 202)
         self.assertEqual(r.json(), {"status": "ignored", "reason": "unsupported_event"})
+        self.mock_dispatch.assert_not_awaited()
 
     async def test_unsupported_action_is_ignored(self):
         delivery_id = self._delivery_id()
@@ -214,6 +230,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(r.status_code, 202)
         self.assertEqual(r.json(), {"status": "ignored", "reason": "unsupported_action"})
+        self.mock_dispatch.assert_not_awaited()
 
     async def test_different_label_is_ignored(self):
         delivery_id = self._delivery_id()
@@ -225,6 +242,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(r.status_code, 202)
         self.assertEqual(r.json(), {"status": "ignored", "reason": "irrelevant_label"})
+        self.mock_dispatch.assert_not_awaited()
 
     async def test_uncurated_issue_is_ignored(self):
         delivery_id = self._delivery_id()
@@ -236,6 +254,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(r.status_code, 202)
         self.assertEqual(r.json(), {"status": "ignored", "reason": "uncurated_issue"})
+        self.mock_dispatch.assert_not_awaited()
 
     async def test_missing_issue_number_returns_400(self):
         delivery_id = self._delivery_id()
