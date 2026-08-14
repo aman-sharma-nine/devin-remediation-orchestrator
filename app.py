@@ -8,17 +8,21 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
 
 from flow import dispatch, poll_loop, handle_workflow_run
 from gh import verify_signature
-from store import close_connection, init_db, record_delivery
+from store import close_connection, get_dashboard_data, init_db, record_delivery
 
 logger = logging.getLogger("orchestrator")
 
 ADVISORIES_PATH = Path(__file__).resolve().parent / "advisories.json"
+TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
 CURATED_LABEL = "devin-remediate"
+
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 
 def _load_advisories() -> dict:
@@ -86,6 +90,43 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    return templates.TemplateResponse(request, "dashboard.html", {})
+
+
+@app.get("/api/metrics")
+async def api_metrics():
+    """Read-only dashboard evidence: totals plus safe per-session fields.
+
+    Never returns credentials, configuration, delivery data, or internal
+    notes - only the fields the dashboard needs to answer whether a task
+    was dispatched, whether a PR was opened, and whether CI verified it.
+    """
+    github_repo = os.environ.get("GITHUB_REPO", "")
+    data = get_dashboard_data()
+
+    sessions = []
+    for row in data["sessions"]:
+        issue_number = row["issue_number"]
+        issue_url = f"https://github.com/{github_repo}/issues/{issue_number}" if github_repo else None
+        sessions.append({
+            "issue_number": issue_number,
+            "issue_url": issue_url,
+            "session_id": row.get("session_id"),
+            "session_url": row.get("session_url"),
+            "pr_url": row.get("pr_url"),
+            "outcome": row.get("outcome"),
+            "phase": row.get("phase"),
+            "check_state": row.get("check_state"),
+            "repair_attempts": row.get("repair_attempts"),
+            "dispatched_at": row.get("dispatched_at"),
+            "verified_at": row.get("verified_at"),
+        })
+
+    return {"totals": data["totals"], "sessions": sessions}
 
 
 def _ignored(reason: str):

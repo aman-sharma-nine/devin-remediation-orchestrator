@@ -118,8 +118,25 @@ has started (see below).
 sender, not a human), but still require a valid signature and the
 configured repository.
 
+## Dashboard (Step 11)
+
+- **Dashboard:** [http://localhost:8000/](http://localhost:8000/)
+- **Metrics endpoint:** [http://localhost:8000/api/metrics](http://localhost:8000/api/metrics)
+
+The page fetches `/api/metrics` once on load and every 5 seconds after,
+updating the totals, table, and "Last updated" time in place — no page
+reload. It shows three totals (**Dispatched**, **PRs opened**, **CI
+verified**) and one table with five columns: **Issue**, **Devin session**,
+**Pull request**, **Verification**, **Repair attempts**. Verification is
+shown as a readable badge (Verified / Awaiting CI / Repairing / Needs
+human / Pending); a missing link renders as an em dash.
+
+The dashboard is entirely read-only: it reports exactly what is already
+stored by Steps 7–10 and never writes to the database, creates a session,
+or triggers a webhook.
+
 Run the tests:
 
 ```bash
-python -m unittest -v test_webhook.py test_dispatch.py test_polling.py test_verification.py
+python -m unittest -v test_webhook.py test_dispatch.py test_polling.py test_verification.py test_dashboard.py
 ```

@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Devin Remediation Orchestrator</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2f3a;
+    --text: #e7e9ee;
+    --muted: #9aa3b2;
+    --accent: #4c8bf5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 2rem;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 1.5rem;
+  }
+  h1 {
+    font-size: 1.4rem;
+    margin: 0;
+  }
+  #last-updated {
+    color: var(--muted);
+    font-size: 0.85rem;
+  }
+  .totals {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 1rem;
+    margin-bottom: 2rem;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+  }
+  .card-label {
+    color: var(--muted);
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .card-value {
+    font-size: 2rem;
+    font-weight: 600;
+    margin-top: 0.25rem;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  th, td {
+    text-align: left;
+    padding: 0.6rem 0.9rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.9rem;
+  }
+  th {
+    color: var(--muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 0.75rem;
+    letter-spacing: 0.04em;
+  }
+  tbody tr:last-child td {
+    border-bottom: none;
+  }
+  a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  a:hover {
+    text-decoration: underline;
+  }
+  .empty-state {
+    color: var(--muted);
+    text-align: center;
+    padding: 1.5rem;
+  }
+  .badge {
+    display: inline-block;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+  .badge-verified { background: #14532d; color: #86efac; }
+  .badge-awaiting { background: #3f3f10; color: #fde68a; }
+  .badge-repairing { background: #1e3a5f; color: #93c5fd; }
+  .badge-needs-human { background: #4c1d1d; color: #fca5a5; }
+  .badge-pending { background: #2a2f3a; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Devin Remediation Orchestrator</h1>
+  <div id="last-updated">Last updated: —</div>
+</header>
+
+<section class="totals">
+  <div class="card">
+    <div class="card-label">Dispatched</div>
+    <div class="card-value" id="total-dispatched">0</div>
+  </div>
+  <div class="card">
+    <div class="card-label">PRs opened</div>
+    <div class="card-value" id="total-prs">0</div>
+  </div>
+  <div class="card">
+    <div class="card-label">CI verified</div>
+    <div class="card-value" id="total-verified">0</div>
+  </div>
+</section>
+
+<table id="sessions-table">
+  <thead>
+    <tr>
+      <th>Issue</th>
+      <th>Devin session</th>
+      <th>Pull request</th>
+      <th>Verification</th>
+      <th>Repair attempts</th>
+    </tr>
+  </thead>
+  <tbody id="sessions-body"></tbody>
+</table>
+
+<script>
+  function linkOrDash(url, label) {
+    if (!url) {
+      const span = document.createElement("span");
+      span.textContent = "—";
+      return span;
+    }
+    const a = document.createElement("a");
+    a.href = url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = label;
+    return a;
+  }
+
+  function badgeClass(outcome) {
+    if (outcome === "verified") return "badge-verified";
+    if (outcome === "awaiting_ci") return "badge-awaiting";
+    if (outcome === "repairing") return "badge-repairing";
+    if (outcome === "needs_human" || outcome === "blocked") return "badge-needs-human";
+    return "badge-pending";
+  }
+
+  function verificationLabel(outcome) {
+    if (outcome === "verified") return "Verified";
+    if (outcome === "awaiting_ci") return "Awaiting CI";
+    if (outcome === "repairing") return "Repairing";
+    if (outcome === "needs_human" || outcome === "blocked") return "Needs human";
+    return "Pending";
+  }
+
+  function buildRow(session) {
+    const tr = document.createElement("tr");
+
+    const issueTd = document.createElement("td");
+    issueTd.appendChild(linkOrDash(session.issue_url, "#" + session.issue_number));
+    tr.appendChild(issueTd);
+
+    const sessionTd = document.createElement("td");
+    sessionTd.appendChild(linkOrDash(session.session_url, "Session"));
+    tr.appendChild(sessionTd);
+
+    const prTd = document.createElement("td");
+    prTd.appendChild(linkOrDash(session.pr_url, "PR"));
+    tr.appendChild(prTd);
+
+    const verTd = document.createElement("td");
+    const badge = document.createElement("span");
+    badge.className = "badge " + badgeClass(session.outcome);
+    badge.textContent = verificationLabel(session.outcome);
+    verTd.appendChild(badge);
+    tr.appendChild(verTd);
+
+    const repairTd = document.createElement("td");
+    const attempts = session.repair_attempts;
+    repairTd.textContent = String(attempts === null || attempts === undefined ? 0 : attempts);
+    tr.appendChild(repairTd);
+
+    return tr;
+  }
+
+  function renderEmptyRow(tbody) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 5;
+    td.className = "empty-state";
+    td.textContent = "No sessions dispatched yet.";
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  }
+
+  async function refresh() {
+    let data;
+    try {
+      const res = await fetch("/api/metrics");
+      if (!res.ok) return;
+      data = await res.json();
+    } catch (err) {
+      return;
+    }
+
+    document.getElementById("total-dispatched").textContent = data.totals.dispatched;
+    document.getElementById("total-prs").textContent = data.totals.prs_opened;
+    document.getElementById("total-verified").textContent = data.totals.ci_verified;
+
+    const tbody = document.getElementById("sessions-body");
+    while (tbody.firstChild) {
+      tbody.removeChild(tbody.firstChild);
+    }
+
+    if (!data.sessions || data.sessions.length === 0) {
+      renderEmptyRow(tbody);
+    } else {
+      data.sessions.forEach(function (session) {
+        tbody.appendChild(buildRow(session));
+      });
+    }
+
+    document.getElementById("last-updated").textContent =
+      "Last updated: " + new Date().toLocaleTimeString();
+  }
+
+  refresh();
+  setInterval(refresh, 5000);
+</script>
+</body>
+</html>

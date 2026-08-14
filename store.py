@@ -503,6 +503,41 @@ def record_repair_pushed(issue_number: int, head_sha: str) -> bool:
         return True
 
 
+def get_dashboard_data() -> dict:
+    """Return read-only dashboard data: three totals and all session rows,
+    newest first by dispatched_at.
+
+    Read-only - does not write to the database.
+    """
+    with _lock:
+        if _conn is None:
+            raise RuntimeError("database connection has not been initialized")
+
+        dispatched = _conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE session_id IS NOT NULL AND session_id != ''"
+        ).fetchone()[0]
+
+        prs_opened = _conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE pr_url IS NOT NULL AND pr_url != ''"
+        ).fetchone()[0]
+
+        ci_verified = _conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE outcome = 'verified' AND check_state = 'green'"
+        ).fetchone()[0]
+
+        cursor = _conn.execute("SELECT * FROM sessions ORDER BY dispatched_at DESC")
+        sessions = [dict(row) for row in cursor.fetchall()]
+
+    return {
+        "totals": {
+            "dispatched": dispatched,
+            "prs_opened": prs_opened,
+            "ci_verified": ci_verified,
+        },
+        "sessions": sessions,
+    }
+
+
 def close_connection():
     global _conn
     with _lock:
