@@ -6,22 +6,40 @@ A small FastAPI service that turns one curated GitHub security advisory into
 a fully independently-verified remediation, using Devin to do the work and
 GitHub Actions — not Devin — to decide whether it succeeded.
 
-Hero flow:
+### End-to-end architecture
 
-```text
-devin-remediate label on a curated issue
-  → signed webhook accepted
-  → issue claimed once in SQLite
-  → one Devin v3 session created
-  → session polled until it opens a draft PR
-  → PR head SHA recorded
-  → verify-remediation CI runs on that PR
-  → workflow_run webhook received
-  → CI success (and untouched verifier files) → outcome=verified
-  → CI failure → one repair message to the same session, then re-verify
-  → second failure → needs_human, no further automation
-  → dashboard shows live totals: dispatched / PRs opened / CI verified
+```mermaid
+flowchart LR
+    ISSUE["Curated GitHub issue<br/><code>devin-remediate</code> label"]
+    ORCH["Orchestrator<br/>validate · start · track"]
+    DEVIN["Devin session<br/>investigate · implement · test"]
+    PR["Draft pull request<br/>human approval remains"]
+    CI["GitHub Actions<br/>verify the exact PR commit"]
+    DASH["Dashboard<br/>status · outputs · results"]
+
+    ISSUE -->|signed webhook| ORCH
+    ORCH -->|Devin API| DEVIN
+    DEVIN -->|opens or updates| PR
+    PR -->|verify-remediation| CI
+    CI -->|result| ORCH
+    ORCH -->|report evidence| DASH
+    ORCH -.->|first CI failure: repair same session| DEVIN
 ```
+
+The solid arrows show the normal path from an approved issue to a verified
+draft PR. The dotted arrow is the single repair path. The orchestrator owns
+policy and state, Devin does the adaptable engineering work, GitHub Actions
+decides whether the exact commit passed, and a human still decides whether to
+merge.
+
+Four boundaries keep the loop controlled:
+
+- GitHub issue text is never used as an agent prompt; only trusted advisory
+  data is sent to Devin.
+- Delivery and issue-level idempotency prevent duplicate sessions.
+- Devin finishing is not success; only CI on the recorded PR head SHA can
+  mark a session verified.
+- Automation gets one repair attempt, then stops for human review.
 
 ## 2. Prerequisites
 
