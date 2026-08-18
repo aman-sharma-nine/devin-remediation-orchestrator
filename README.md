@@ -21,16 +21,18 @@ flowchart LR
     ORCH -->|Devin API| DEVIN
     DEVIN -->|opens or updates| PR
     PR -->|verify-remediation| CI
-    CI -->|result| ORCH
-    ORCH -->|report evidence| DASH
+    CI -->|result, via webhook to the orchestrator| DASH
     ORCH -.->|first CI failure: repair same session| DEVIN
 ```
 
 The solid arrows show the normal path from an approved issue to a verified
-draft PR. The dotted arrow is the single repair path. The orchestrator owns
-policy and state, Devin does the adaptable engineering work, GitHub Actions
-decides whether the exact commit passed, and a human still decides whether to
-merge.
+draft PR, ending at the dashboard. The dotted arrow is the single repair
+path: on the first CI failure, the orchestrator sends a message back to the
+*same* Devin session rather than starting a new one. The orchestrator
+receives every step's webhook and updates the dashboard throughout — that
+per-stage handoff is condensed into one line here for readability. Devin
+does the adaptable engineering work, GitHub Actions decides whether the
+exact commit passed, and a human still decides whether to merge.
 
 Four boundaries keep the loop controlled:
 
