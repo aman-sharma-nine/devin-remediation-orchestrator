@@ -9,7 +9,7 @@ GitHub Actions — not Devin — to decide whether it succeeded.
 ### End-to-end architecture
 
 ```mermaid
-flowchart LR
+flowchart TD
     ISSUE["Curated GitHub issue<br/><code>devin-remediate</code> label"]
     ORCH["Orchestrator<br/>validate · start · track"]
     DEVIN["Devin session<br/>investigate · implement · test"]
